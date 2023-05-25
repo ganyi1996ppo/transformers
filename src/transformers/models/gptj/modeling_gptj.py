@@ -74,12 +74,16 @@ def rotate_every_two(x: torch.Tensor) -> torch.Tensor:
 
 
 def apply_rotary_pos_emb(tensor: torch.Tensor, sin: torch.Tensor, cos: torch.Tensor) -> torch.Tensor:
-    sin = torch.repeat_interleave(sin[:, :, None, :], 2, 3)
-    cos = torch.repeat_interleave(cos[:, :, None, :], 2, 3)
-    return (tensor * cos) + (rotate_every_two(tensor) * sin)
+    rotate_tensor = rotate_every_two(tensor) * sin
+    tensor *= cos
+    tensor += rotate_tensor
 
 
 class GPTJAttention(nn.Module):
+    position_ids = None
+    cached_sin_embed = None
+    cached_cos_embed = None
+
     def __init__(self, config):
         super().__init__()
 
@@ -191,6 +195,30 @@ class GPTJAttention(nn.Module):
             self.embed_positions = embed_positions
         return embed_positions.repeat(position_ids.shape[0], 1, 1)
 
+    def _get_rotary_embed_positions(self, position_ids, embed_positions):
+        if GPTJAttention.position_ids is None or GPTJAttention.position_ids != position_ids:
+            repeated_position_ids = position_ids.unsqueeze(-1).repeat(1, 1, embed_positions.shape[-1])
+            sincos = torch.gather(embed_positions, 1, repeated_position_ids)
+            sin, cos = torch.split(sincos, sincos.shape[-1] // 2, dim=-1)
+            sin = torch.repeat_interleave(sin[:, :, None, :], 2, 3)
+            cos = torch.repeat_interleave(cos[:, :, None, :], 2, 3)
+            GPTJAttention.position_ids = position_ids
+            GPTJAttention.cached_sin_embed = sin
+            GPTJAttention.cached_cos_embed = cos
+        return GPTJAttention.cached_sin_embed, GPTJAttention.cached_cos_embed
+
+    def get_rotary_embed_positions(self, position_ids, embed_positions):
+        if GPTJAttention.position_ids is None or GPTJAttention.position_ids != position_ids:
+            repeated_position_ids = position_ids.unsqueeze(-1).repeat(1, 1, embed_positions.shape[-1])
+            sincos = torch.gather(embed_positions, 1, repeated_position_ids)
+            sin, cos = torch.split(sincos, sincos.shape[-1] // 2, dim=-1)
+            sin = torch.repeat_interleave(sin[:, :, None, :], 2, 3)
+            cos = torch.repeat_interleave(cos[:, :, None, :], 2, 3)
+            GPTJAttention.position_ids = position_ids
+            GPTJAttention.cached_sin_embed = sin
+            GPTJAttention.cached_cos_embed = cos
+        return GPTJAttention.cached_sin_embed, GPTJAttention.cached_cos_embed
+
     def forward(
         self,
         hidden_states: torch.FloatTensor,
@@ -216,28 +244,20 @@ class GPTJAttention(nn.Module):
             # The logic to conditionally copy to GPU could not be traced, so we do this
             # every time in the torch.fx case
             embed_positions = get_embed_positions(self.embed_positions, position_ids)
+            sin, cos = self.get_rotary_embed_positions(embed_positions, position_ids)
         else:
             embed_positions = self._get_embed_positions(position_ids)
+            sin, cos = self._get_rotary_embed_positions(embed_positions, position_ids)
 
-        repeated_position_ids = position_ids.unsqueeze(-1).repeat(1, 1, embed_positions.shape[-1])
-        sincos = torch.gather(embed_positions, 1, repeated_position_ids)
-        sin, cos = torch.split(sincos, sincos.shape[-1] // 2, dim=-1)
 
         if self.rotary_dim is not None:
-            k_rot = key[:, :, :, : self.rotary_dim]
-            k_pass = key[:, :, :, self.rotary_dim :]
 
-            q_rot = query[:, :, :, : self.rotary_dim]
-            q_pass = query[:, :, :, self.rotary_dim :]
+            apply_rotary_pos_emb(key[:, :, :, : self.rotary_dim], sin, cos)
+            apply_rotary_pos_emb(query[:, :, :, : self.rotary_dim], sin, cos)
 
-            k_rot = apply_rotary_pos_emb(k_rot, sin, cos)
-            q_rot = apply_rotary_pos_emb(q_rot, sin, cos)
-
-            key = torch.cat([k_rot, k_pass], dim=-1)
-            query = torch.cat([q_rot, q_pass], dim=-1)
         else:
-            key = apply_rotary_pos_emb(key, sin, cos)
-            query = apply_rotary_pos_emb(query, sin, cos)
+            apply_rotary_pos_emb(key, sin, cos)
+            apply_rotary_pos_emb(query, sin, cos)
 
         key = key.permute(0, 2, 1, 3)
         query = query.permute(0, 2, 1, 3)
